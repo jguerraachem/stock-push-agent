@@ -1,62 +1,56 @@
 import os
-import json
-from pathlib import Path
+from datetime import datetime, timezone
+
 import requests
 import yfinance as yf
 
 # =======================
-# CONFIG (EDITA AQUÍ)
+# CONFIG
 # =======================
-WATCHLIST = [
-    {"ticker": "QQQM", "push_every_run": True, "above": None, "below": None},
-    {"ticker": "MAGS", "push_every_run": True, "above": None, "below": None},
-    {"ticker": "IBIT", "push_every_run": True, "above": None, "below": None},
-    {"ticker": "AMZN", "push_every_run": True, "above": None, "below": None},
-    {"ticker": "V",    "push_every_run": True, "above": None, "below": None},
-    {"ticker": "GLDM", "push_every_run": True, "above": None, "below": None},
-    {"ticker": "VOO",  "push_every_run": True, "above": None, "below": None},
-    {"ticker": "JEPQ", "push_every_run": True, "above": None, "below": None},
-    {"ticker": "O",    "push_every_run": True, "above": None, "below": None},
-    {"ticker": "MCD",  "push_every_run": True, "above": None, "below": None},
-    {"ticker": "VYM",  "push_every_run": True, "above": None, "below": None},
-    {"ticker": "VTI",  "push_every_run": True, "above": None, "below": None},
-]
+TICKERS = ["QQQM", "MAGS", "IBIT", "AMZN", "V", "GLDM", "VOO", "JEPQ", "O", "MCD", "VYM", "VTI"]
 
-# Pushover keys (variables de entorno)
 PUSHOVER_USER_KEY = os.environ.get("PUSHOVER_USER_KEY")
 PUSHOVER_APP_TOKEN = os.environ.get("PUSHOVER_APP_TOKEN")
 
-STATE_FILE = Path("alert_state.json")
+PUSH_PRIORITY = int(os.environ.get("PUSH_PRIORITY", "0"))  # 0 normal, 1 high
+PUSH_SOUND = os.environ.get("PUSH_SOUND", "pushover")      # e.g. "pushover", "cashregister", "siren"
 
 
-def load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {}
-
-
-def save_state(state: dict):
-    STATE_FILE.write_text(json.dumps(state, indent=2))
-
-
-def push(title: str, message: str, priority: int = 0):
+def push(title: str, message: str):
     if not PUSHOVER_USER_KEY or not PUSHOVER_APP_TOKEN:
-        raise RuntimeError("Faltan PUSHOVER_USER_KEY y/o PUSHOVER_APP_TOKEN.")
+        raise RuntimeError(
+            "Missing PUSHOVER_USER_KEY and/or PUSHOVER_APP_TOKEN. "
+            "Add them as GitHub Actions Secrets and pass via workflow env."
+        )
+
+    title = title.strip()[:100]
+    message = message.strip()[:1024]  # Pushover message limit safety
+
     r = requests.post(
         "https://api.pushover.net/1/messages.json",
         data={
-            "token": PUSHOVER_APP_TOKEN,
-            "user": PUSHOVER_USER_KEY,
+            "token": PUSHOVER_APP_TOKEN.strip(),
+            "user": PUSHOVER_USER_KEY.strip(),
             "title": title,
             "message": message,
-            "priority": priority,
+            "priority": PUSH_PRIORITY,
+            "sound": PUSH_SOUND,
         },
         timeout=20,
     )
+
+    if r.status_code != 200:
+        print("Pushover HTTP:", r.status_code)
+        print("Pushover body:", r.text)
+
     r.raise_for_status()
 
 
-def get_quote(ticker: str):
+def get_quote_line(ticker: str) -> str:
+    """
+    Returns: 'TICKER: 123.45 (+1.23%)'
+    Works anytime. If previous_close isn't available, falls back to last 2 daily closes.
+    """
     t = yf.Ticker(ticker)
     fi = t.fast_info
 
@@ -65,6 +59,8 @@ def get_quote(ticker: str):
 
     if last is None or prev_close is None:
         hist = t.history(period="5d", interval="1d")
+        if hist.shape[0] < 2:
+            return f"{ticker}: ERROR (not enough history)"
         last = float(hist["Close"].iloc[-1])
         prev_close = float(hist["Close"].iloc[-2])
 
@@ -72,79 +68,26 @@ def get_quote(ticker: str):
     prev_close = float(prev_close)
 
     pct_change = ((last / prev_close) - 1.0) * 100.0
-    return last, pct_change, prev_close
+    sign = "+" if pct_change >= 0 else ""
+    return f"{ticker}: {last:,.2f} ({sign}{pct_change:.2f}%)"
 
 
-def crossed(prev: float, curr: float, level: float, direction: str) -> bool:
-    # direction: "above" or "below"
-    if direction == "above":
-        return prev < level <= curr
-    if direction == "below":
-        return prev > level >= curr
-    raise ValueError("direction must be 'above' or 'below'")
+def main():
+    now_utc = datetime.now(timezone.utc)
+    timestamp = now_utc.strftime("%Y-%m-%d %H:%M UTC")
 
+    lines = []
+    for tk in TICKERS:
+        try:
+            lines.append(get_quote_line(tk))
+        except Exception as e:
+            lines.append(f"{tk}: ERROR ({e.__class__.__name__})")
 
-def check_once():
-    state = load_state()
+    message = f"{timestamp}\n" + "\n".join(lines)
 
-    for rule in WATCHLIST:
-        ticker = rule["ticker"].upper()
-        push_every_run = bool(rule.get("push_every_run", False))
-        above = rule.get("above")
-        below = rule.get("below")
-
-        price, pct_change, prev_close = get_quote(ticker)
-
-        # Estado por ticker
-        if ticker not in state:
-            state[ticker] = {
-                "last_price_seen": None,
-                "was_above": False,
-                "was_below": False
-            }
-
-        last_seen = state[ticker]["last_price_seen"]
-        should_push = False
-        reason = ""
-
-        if push_every_run:
-            should_push = True
-            reason = "scheduled update"
-        else:
-            # Solo push si cruza umbrales (anti-spam)
-            if above is not None and last_seen is not None:
-                if crossed(float(last_seen), price, float(above), "above"):
-                    should_push = True
-                    reason = f"crossed ABOVE {above}"
-            if below is not None and last_seen is not None:
-                if crossed(float(last_seen), price, float(below), "below"):
-                    should_push = True
-                    reason = f"crossed BELOW {below}"
-
-        # Mensaje
-        sign = "+" if pct_change >= 0 else ""
-        title = f"{ticker} {price:,.2f}"
-        msg = (
-            f"Price: {price:,.2f}\n"
-            f"Day change: {sign}{pct_change:.2f}% (vs {prev_close:,.2f})\n"
-            f"Trigger: {reason if reason else '—'}"
-        )
-
-        if should_push:
-            push(title=title, message=msg)
-
-        # Log local
-        print(f"{ticker}: {price:,.2f} | {pct_change:+.2f}% | pushed={should_push} | {reason}")
-
-        # Actualiza estado
-        state[ticker]["last_price_seen"] = price
-        if above is not None:
-            state[ticker]["was_above"] = price >= float(above)
-        if below is not None:
-            state[ticker]["was_below"] = price <= float(below)
-
-    save_state(state)
+    push(title="Watchlist Test: Price & % Day", message=message)
+    print("Push sent:\n" + message)
 
 
 if __name__ == "__main__":
-    check_once()
+    main()
