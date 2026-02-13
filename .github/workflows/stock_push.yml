@@ -1,11 +1,14 @@
-name: Stock Push (Manual Test Only)
+name: Stock Push (Hourly, Market Only, Consolidated)
 
 on:
+  schedule:
+    - cron: "0 * * * 1-5"
   workflow_dispatch:
 
 jobs:
   run-agent:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,7 +23,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run push agent (anytime)
+      - name: Run consolidated watchlist push (market only)
         env:
           PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
           PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
