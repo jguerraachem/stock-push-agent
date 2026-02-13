@@ -1,8 +1,6 @@
-name: Stock Push Alerts
+name: Stock Push (Manual Test Only)
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"   # cada hora (UTC)
   workflow_dispatch:
 
 jobs:
@@ -22,7 +20,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run agent
+      - name: Run push agent (anytime)
         env:
           PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
           PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
