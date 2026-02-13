@@ -1,8 +1,7 @@
 name: Stock Push (Hourly, Market Only, Consolidated)
 
 on:
-  schedule:
-    - cron: "0 * * * 1-5"  # hourly, Mon-Fri (UTC); script enforces "market open"
+  
   workflow_dispatch:
 
 jobs:
