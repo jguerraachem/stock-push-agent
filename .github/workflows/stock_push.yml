@@ -2,7 +2,7 @@ name: Stock Push Alerts
 
 on:
   schedule:
-    - cron: "*/5 * * * *""   # cada hora (UTC)
+    - cron: "*/5 * * * *"   # cada hora (UTC)
   workflow_dispatch:
 
 jobs:
