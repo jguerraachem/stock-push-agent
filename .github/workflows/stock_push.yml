@@ -2,13 +2,12 @@ name: Stock Push (Hourly, Market Only, Consolidated)
 
 on:
   schedule:
-    - cron: "0 * * * 1-5"
+    - cron: "0 * * * 1-5"  # hourly, Mon-Fri (UTC); script enforces "market open"
   workflow_dispatch:
 
 jobs:
   run-agent:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,9 +22,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run consolidated watchlist push (market only)
+      - name: Run agent
         env:
           PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
           PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
+          # Optional:
+          # PUSH_PRIORITY: "1"
+          # PUSH_SOUND: "cashregister"
+          # FORCE_PUSH: "1"   # enable only for testing while market is closed
         run: |
-          python push_price_change_agent.py
+          python push_watchlist_consolidated.py
