@@ -1,1 +1,4 @@
-requirements.txt
+yfinance
+requests
+pandas_market_calendars
+pandas
