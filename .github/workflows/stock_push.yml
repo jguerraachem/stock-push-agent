@@ -31,4 +31,4 @@ jobs:
           # PUSH_SOUND: "cashregister"
           # FORCE_PUSH: "1"   # enable only for testing while market is closed
         run: |
-          python push_price_change_agent.py
+          python push_watchlist_consolidated.py
