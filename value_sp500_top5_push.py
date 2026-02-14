@@ -29,7 +29,7 @@ RULES = {
     "pe_pb_max": 35.0,
     "earnings_yield_min": 0.05,
     "debt_to_equity_max": 0.75,
-    "current_ratio_min": 1.5,
+    "current_ratio_min": 1.5,   # will be ignored for Financials
     "roe_min": 0.10,
     "market_cap_min": 5e9,
 }
@@ -38,7 +38,7 @@ WEIGHTS = {
     "earnings_yield": 0.50,
     "low_pb": 0.20,
     "low_de": 0.15,
-    "high_current_ratio": 0.10,
+    "high_current_ratio": 0.10,  # for non-financials only (we'll treat missing as 0)
     "roe": 0.05,
 }
 
@@ -186,32 +186,42 @@ def fetch_info_with_retries(t: yf.Ticker, retries: int) -> Dict:
     raise last_exc or RuntimeError("Unknown yfinance info error")
 
 
+def is_financial(info: Dict) -> bool:
+    sector = (info.get("sector") or "").lower()
+    industry = (info.get("industry") or "").lower()
+    # robust enough for yfinance labels
+    if "financial" in sector:
+        return True
+    if any(k in industry for k in ("insurance", "bank", "capital markets", "asset management", "credit", "reinsurance")):
+        return True
+    return False
+
+
 def compute_metrics(ticker: str, info: Dict) -> Dict:
     pe = safe_float(info.get("trailingPE") or info.get("forwardPE"))
     pb = safe_float(info.get("priceToBook"))
-    book_value = safe_float(info.get("bookValue"))  # per-share book value
+    book_value = safe_float(info.get("bookValue"))
     mcap = safe_float(info.get("marketCap"))
     de = safe_float(info.get("debtToEquity"))
     cr = safe_float(info.get("currentRatio"))
     roe = safe_float(info.get("returnOnEquity"))
     price = safe_float(info.get("regularMarketPrice") or info.get("currentPrice"))
+    sector = info.get("sector")
+    industry = info.get("industry")
 
     # Normalize debtToEquity if percent-like
     if de is not None and de > 10:
         de = de / 100.0
 
-    # ----- P/B sanity + fallback calculation -----
-    # yfinance sometimes returns tiny / wrong priceToBook values (e.g. ~0.001)
-    # If pb is missing or suspiciously low, compute pb = price / bookValue (if available)
+    # P/B sanity + fallback
     if pb is None or pb < 0.1:
         if price is not None and book_value is not None and book_value > 0:
             pb = price / book_value
-
-    # final sanity bounds for pb
     if pb is not None and (pb < 0.1 or pb > 20):
         pb = None
 
     earnings_yield = (1.0 / pe) if (pe and pe > 0) else None
+    fin = is_financial(info)
 
     return {
         "ticker": ticker,
@@ -223,6 +233,9 @@ def compute_metrics(ticker: str, info: Dict) -> Dict:
         "current_ratio": cr,
         "roe": roe,
         "earnings_yield": earnings_yield,
+        "sector": sector,
+        "industry": industry,
+        "is_financial": fin,
     }
 
 
@@ -234,6 +247,7 @@ def passes_rules(r: Dict) -> bool:
     cr = r["current_ratio"]
     roe = r["roe"]
     mcap = r["market_cap"]
+    fin = bool(r.get("is_financial", False))
 
     if mcap is None or mcap < RULES["market_cap_min"]:
         return False
@@ -247,12 +261,16 @@ def passes_rules(r: Dict) -> bool:
         return False
     if de is None or de > RULES["debt_to_equity_max"]:
         return False
-    if cr is None or cr < RULES["current_ratio_min"]:
-        return False
+
+    # Key change: ignore Current Ratio rule for Financials
+    if not fin:
+        if cr is None or cr < RULES["current_ratio_min"]:
+            return False
+
     if roe is None or roe < RULES["roe_min"]:
         return False
 
-    # extra sanity
+    # Extra sanity
     if pe > 100:
         return False
     if roe < 0 or roe > 1.5:
@@ -268,10 +286,13 @@ def score(r: Dict) -> float:
     pb = r["pb"]
     de = r["debt_to_equity"]
     cr = r["current_ratio"] or 0.0
+    fin = bool(r.get("is_financial", False))
 
     low_pb = (1.0 / pb) if (pb and pb > 0) else 0.0
     low_de = (1.0 / (1.0 + de)) if (de is not None and de >= 0) else 0.0
-    high_cr = min(cr / 3.0, 1.0)
+
+    # For financials, don't reward current ratio (not meaningful); treat as 0.
+    high_cr = 0.0 if fin else min(cr / 3.0, 1.0)
 
     return (
         WEIGHTS["earnings_yield"] * ey
@@ -310,7 +331,6 @@ def main():
     all_tickers = get_sp500_tickers()
     print(f"Loaded {len(all_tickers)} tickers (pre-sample)")
 
-    # Daily random sample to avoid alphabetical bias
     random.seed(datetime.utcnow().strftime("%Y-%m-%d"))
     random.shuffle(all_tickers)
     tickers = all_tickers[:min(MAX_TICKERS, len(all_tickers))]
@@ -328,8 +348,13 @@ def main():
             info = fetch_info_with_retries(t, INFO_RETRIES)
             r = compute_metrics(tk, info)
 
-            core_needed = ["pe", "pb", "market_cap", "debt_to_equity", "current_ratio", "roe", "earnings_yield"]
-            if any(r.get(k) is None for k in core_needed):
+            # Current ratio is optional for financials, so compute "required fields" dynamically
+            fin = bool(r.get("is_financial", False))
+            required = ["pe", "pb", "market_cap", "debt_to_equity", "roe", "earnings_yield"]
+            if not fin:
+                required.append("current_ratio")
+
+            if any(r.get(k) is None for k in required):
                 missing_data += 1
                 continue
 
@@ -361,11 +386,13 @@ def main():
     for _, r in df.iterrows():
         pe = r["pe"]
         pb = r["pb"]
+        fin_tag = "FIN" if r.get("is_financial") else "NON-FIN"
+        sector = r.get("sector") or "—"
         lines.append(
-            f"{r['ticker']}: EY {fmt_pct(r['earnings_yield'])} | "
+            f"{r['ticker']} [{fin_tag}] ({sector}): EY {fmt_pct(r['earnings_yield'])} | "
             f"P/E {fmt_num(pe)} | P/B {fmt_num(pb)} | PExPB {fmt_num(pe*pb)} | "
             f"ROE {fmt_pct(r['roe'])} | D/E {fmt_num(r['debt_to_equity'])} | "
-            f"CR {fmt_num(r['current_ratio'])} | MCap {fmt_mcap(r['market_cap'])}"
+            f"CR {fmt_num(r.get('current_ratio'))} | MCap {fmt_mcap(r['market_cap'])}"
         )
 
     message = "Top 5 — Graham Modern (Free)\n" + "\n".join(lines)
