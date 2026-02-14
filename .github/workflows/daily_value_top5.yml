@@ -4,6 +4,9 @@ on:
   
   workflow_dispatch:
 
+env:
+  PUSHOVER_SOUND: "cashregister"
+  
 jobs:
   run-agent:
     runs-on: ubuntu-latest
