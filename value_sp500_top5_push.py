@@ -1,6 +1,5 @@
 import os
 import math
-import time
 import requests
 import pandas as pd
 import yfinance as yf
@@ -12,12 +11,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 PUSHOVER_USER_KEY = os.environ.get("PUSHOVER_USER_KEY")
 PUSHOVER_APP_TOKEN = os.environ.get("PUSHOVER_APP_TOKEN")
 
-# Optional knobs
 TOP_N = int(os.environ.get("TOP_N", "5"))
-MAX_TICKERS = int(os.environ.get("MAX_TICKERS", "503"))  # set 200 if you want it faster
-THREADS = int(os.environ.get("THREADS", "10"))           # 8–16 usually ok
+MAX_TICKERS = int(os.environ.get("MAX_TICKERS", "503"))   # baja a 200 si quieres más rápido
+THREADS = int(os.environ.get("THREADS", "10"))            # 8–16 ok
 
-# If 1, require FCF yield to be present and >= min. If 0, treat missing FCF as neutral.
+# Require FCF yield or not (free data sometimes missing)
 REQUIRE_FCF = os.environ.get("REQUIRE_FCF", "0") == "1"
 
 # =======================
@@ -26,25 +24,23 @@ REQUIRE_FCF = os.environ.get("REQUIRE_FCF", "0") == "1"
 RULES = {
     "pe_max": 20.0,
     "pb_max": 2.5,
-    "pe_pb_max": 35.0,           # modernized 22.5
-    "earnings_yield_min": 0.05,  # 5%
+    "pe_pb_max": 35.0,
+    "earnings_yield_min": 0.05,
     "debt_to_equity_max": 0.75,
     "current_ratio_min": 1.5,
-    "roe_min": 0.10,             # 10%
-    "market_cap_min": 5e9,       # 5B
-    "fcf_yield_min": 0.05,       # 5% (if REQUIRE_FCF=1)
+    "roe_min": 0.10,
+    "market_cap_min": 5e9,
+    "fcf_yield_min": 0.05,   # only used if REQUIRE_FCF=1
 }
 
-# Score weights (ranking)
 WEIGHTS = {
     "earnings_yield": 0.45,
-    "fcf_yield": 0.25,           # if missing, becomes 0 unless REQUIRE_FCF=0 (we keep 0)
+    "fcf_yield": 0.25,
     "low_pb": 0.15,
     "low_de": 0.10,
     "roe": 0.05,
 }
 
-# Wikipedia page for S&P 500 constituents
 WIKI_SP500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 
 
@@ -60,7 +56,7 @@ def must_env():
 
 def pushover_push(title: str, message: str):
     title = (title or "").strip()[:100]
-    message = (message or "").strip()[:1024]  # pushover limit
+    message = (message or "").strip()[:1024]
 
     r = requests.post(
         "https://api.pushover.net/1/messages.json",
@@ -81,38 +77,43 @@ def pushover_push(title: str, message: str):
 
 
 def get_sp500_symbols() -> list[str]:
-    # Read constituents table from Wikipedia
-    tables = pd.read_html(WIKI_SP500)
-    if not tables:
-        raise RuntimeError("Could not read Wikipedia tables for S&P 500.")
+    """
+    Robust against Wikipedia 403 on GitHub runners:
+    fetch with requests + User-Agent, then parse HTML string.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; value-agent/1.0; +https://github.com/)",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "close",
+    }
+    resp = requests.get(WIKI_SP500, headers=headers, timeout=30)
+    resp.raise_for_status()
 
-    # The first table is typically the constituents with 'Symbol'
+    # Parse tables from HTML string
+    tables = pd.read_html(resp.text)
+    if not tables:
+        raise RuntimeError("Could not parse Wikipedia tables for S&P 500.")
+
     df = tables[0]
     if "Symbol" not in df.columns:
-        # Try to find the table that contains Symbol
         found = None
         for t in tables:
             if "Symbol" in t.columns:
                 found = t
                 break
         if found is None:
-            raise RuntimeError("Could not find 'Symbol' column in Wikipedia tables.")
+            raise RuntimeError("Could not find 'Symbol' table on Wikipedia page.")
         df = found
 
     symbols = df["Symbol"].astype(str).str.upper().tolist()
+    symbols = [s.replace(".", "-").strip() for s in symbols]
 
-    # Normalize for yfinance: BRK.B -> BRK-B, BF.B -> BF-B, etc.
-    symbols = [s.replace(".", "-") for s in symbols]
-
-    # Remove empties, dedupe, preserve order
-    out = []
-    seen = set()
+    out, seen = [], set()
     for s in symbols:
-        s = s.strip()
-        if not s or s in seen:
-            continue
-        seen.add(s)
-        out.append(s)
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
 
     return out[:MAX_TICKERS]
 
@@ -121,7 +122,6 @@ def safe_float(x):
     try:
         if x is None:
             return None
-        # yfinance sometimes returns numpy types
         return float(x)
     except Exception:
         return None
@@ -129,7 +129,8 @@ def safe_float(x):
 
 def fetch_metrics(ticker: str) -> dict:
     """
-    Uses yfinance .info. This is free but not perfect; missing data is common.
+    Free source: yfinance .info.
+    Missing fields are common; we handle that gracefully.
     """
     try:
         info = yf.Ticker(ticker).info
@@ -139,14 +140,13 @@ def fetch_metrics(ticker: str) -> dict:
     pe = safe_float(info.get("trailingPE") or info.get("forwardPE"))
     pb = safe_float(info.get("priceToBook"))
     mcap = safe_float(info.get("marketCap"))
-    de = safe_float(info.get("debtToEquity"))  # often in % terms? yfinance typically returns numeric ratio or percent-like
+    de = safe_float(info.get("debtToEquity"))
     cr = safe_float(info.get("currentRatio"))
-    roe = safe_float(info.get("returnOnEquity"))  # often decimal (0.15 = 15%)
-    fcf = safe_float(info.get("freeCashflow"))     # absolute dollars
+    roe = safe_float(info.get("returnOnEquity"))
+    fcf = safe_float(info.get("freeCashflow"))
     price = safe_float(info.get("regularMarketPrice") or info.get("currentPrice"))
 
-    # Normalize debtToEquity: yfinance sometimes uses "percent" style (e.g., 120.0 means 1.20)
-    # Heuristic: if > 10, assume it's percent and divide by 100.
+    # normalize debtToEquity if it's percent-like
     if de is not None and de > 10:
         de = de / 100.0
 
@@ -179,31 +179,22 @@ def passes_rules(r: dict) -> bool:
 
     if mcap is None or mcap < RULES["market_cap_min"]:
         return False
-
     if pe is None or pe <= 0 or pe > RULES["pe_max"]:
         return False
-
     if pb is None or pb <= 0 or pb > RULES["pb_max"]:
         return False
-
     if (pe * pb) > RULES["pe_pb_max"]:
         return False
-
     if ey is None or ey < RULES["earnings_yield_min"]:
         return False
-
     if de is None or de > RULES["debt_to_equity_max"]:
         return False
-
     if cr is None or cr < RULES["current_ratio_min"]:
         return False
-
     if roe is None or roe < RULES["roe_min"]:
         return False
-
-    if REQUIRE_FCF:
-        if fy is None or fy < RULES["fcf_yield_min"]:
-            return False
+    if REQUIRE_FCF and (fy is None or fy < RULES["fcf_yield_min"]):
+        return False
 
     return True
 
@@ -229,13 +220,17 @@ def score(r: dict) -> float:
 
 
 def fmt_pct(x):
-    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+    if x is None:
+        return "—"
+    if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
         return "—"
     return f"{x*100:.1f}%"
 
 
 def fmt_num(x):
-    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+    if x is None:
+        return "—"
+    if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
         return "—"
     return f"{x:.2f}"
 
@@ -254,33 +249,29 @@ def main():
     must_env()
 
     tickers = get_sp500_symbols()
-    print(f"Loaded {len(tickers)} S&P 500 tickers from Wikipedia")
+    print(f"Loaded {len(tickers)} S&P 500 tickers (Wikipedia)")
 
     rows = []
     errors = 0
 
-    # Parallel fetch to speed up in GitHub Actions
     with ThreadPoolExecutor(max_workers=THREADS) as ex:
-        futures = {ex.submit(fetch_metrics, t): t for t in tickers}
-        for fut in as_completed(futures):
+        futs = {ex.submit(fetch_metrics, t): t for t in tickers}
+        for fut in as_completed(futs):
             r = fut.result()
             if "error" in r:
                 errors += 1
             rows.append(r)
 
     df = pd.DataFrame(rows)
-
-    # Save artifacts (optional)
     df.to_csv("sp500_value_raw.csv", index=False)
 
-    # Apply rules
     df["pass"] = df.apply(lambda x: passes_rules(x.to_dict()), axis=1)
     passed = df[df["pass"] == True].copy()
 
     if passed.empty:
         msg = (
             "No S&P 500 stocks passed Graham-Modern rules today.\n"
-            f"(REQUIRE_FCF={int(REQUIRE_FCF)}) Consider relaxing: P/E, P/B, D/E, Current Ratio."
+            f"(REQUIRE_FCF={int(REQUIRE_FCF)}) Try relaxing thresholds or set REQUIRE_FCF=0."
         )
         pushover_push("Daily Value Top 5 (Free)", msg)
         print(msg)
@@ -303,10 +294,8 @@ def main():
             f"MCap {fmt_mcap(r.get('market_cap'))}"
         )
 
-    header = f"Top {TOP_N} — Graham Modern (Free)"
-    footer = f"\nErrors: {errors}/{len(tickers)} (missing data is normal on free sources)"
-    message = header + "\n" + "\n".join(lines)
-    # stay under 1024 chars
+    message = "Top 5 — Graham Modern (Free)\n" + "\n".join(lines)
+    footer = f"\nErrors: {errors}/{len(tickers)} (missing data is normal)"
     if len(message) + len(footer) <= 1024:
         message += footer
 
