@@ -1,4 +1,4 @@
-name: Daily Value Top 5 (Free: Wikipedia + yfinance) -> Pushover
+name: Daily Value Top 5
 
 on:
   
