@@ -1,4 +1,4 @@
-name: Daily Value Top 5 (Graham Modern) -> Pushover
+name: Daily Value Top 5 (Free: Wikipedia + yfinance) -> Pushover
 
 on:
   
@@ -21,14 +21,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run daily value agent
+      - name: Run daily value agent (free)
         env:
-          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
           PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
           PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
-          # Optional:
-          # PUSH_TITLE: "Daily Value Top 5"
-          # PUSH_SOUND: "cashregister"
-          # PUSH_PRIORITY: "1"
+          # Optional tuning:
+          # TOP_N: "5"
+          # MAX_TICKERS: "250"
+          # THREADS: "12"
+          # REQUIRE_FCF: "0"
         run: |
           python value_sp500_top5_push.py
