@@ -17,8 +17,8 @@ PUSHOVER_USER_KEY = os.environ.get("PUSHOVER_USER_KEY")
 PUSHOVER_APP_TOKEN = os.environ.get("PUSHOVER_APP_TOKEN")
 
 TOP_N = int(os.environ.get("TOP_N", "5"))
-MAX_TICKERS = int(os.environ.get("MAX_TICKERS", "200"))   # keep 200 for reliability
-INFO_RETRIES = int(os.environ.get("INFO_RETRIES", "2"))   # retries per ticker for yfinance info
+MAX_TICKERS = int(os.environ.get("MAX_TICKERS", "200"))
+INFO_RETRIES = int(os.environ.get("INFO_RETRIES", "2"))
 
 # =======================
 # "GRAHAM MODERN" RULES (practical)
@@ -27,11 +27,11 @@ RULES = {
     "pe_max": 20.0,
     "pb_max": 2.5,
     "pe_pb_max": 35.0,
-    "earnings_yield_min": 0.05,     # 5%
+    "earnings_yield_min": 0.05,
     "debt_to_equity_max": 0.75,
     "current_ratio_min": 1.5,
-    "roe_min": 0.10,                # 10%
-    "market_cap_min": 5e9,          # 5B
+    "roe_min": 0.10,
+    "market_cap_min": 5e9,
 }
 
 WEIGHTS = {
@@ -84,8 +84,7 @@ def pushover_push(title: str, message: str):
 
 def normalize_symbol(sym: str) -> str:
     sym = (sym or "").strip().upper()
-    sym = sym.replace(".", "-")  # BRK.B -> BRK-B
-    return sym
+    return sym.replace(".", "-")
 
 
 def dedupe_preserve_order(items: List[str]) -> List[str]:
@@ -131,10 +130,8 @@ def load_tickers_from_github_dataset() -> Optional[List[str]]:
         resp = requests.get(GITHUB_DATASET_URL, headers=headers, timeout=30)
         resp.raise_for_status()
         df = pd.read_csv(StringIO(resp.text))
-
         if "Symbol" not in df.columns:
             return None
-
         syms = [normalize_symbol(s) for s in df["Symbol"].astype(str).tolist()]
         syms = [s for s in syms if s]
         return dedupe_preserve_order(syms)
@@ -158,11 +155,9 @@ def get_sp500_tickers() -> List[str]:
         tickers = fn()
         if tickers:
             return tickers
-
     fallback = load_tickers_from_fallback_file()
     if fallback:
         return fallback
-
     raise RuntimeError(
         "Could not load S&P 500 tickers from web sources, and fallback file is missing/empty. "
         "Create sp500_tickers_fallback.txt with one ticker per line."
@@ -194,18 +189,26 @@ def fetch_info_with_retries(t: yf.Ticker, retries: int) -> Dict:
 def compute_metrics(ticker: str, info: Dict) -> Dict:
     pe = safe_float(info.get("trailingPE") or info.get("forwardPE"))
     pb = safe_float(info.get("priceToBook"))
+    book_value = safe_float(info.get("bookValue"))  # per-share book value
     mcap = safe_float(info.get("marketCap"))
     de = safe_float(info.get("debtToEquity"))
     cr = safe_float(info.get("currentRatio"))
     roe = safe_float(info.get("returnOnEquity"))
     price = safe_float(info.get("regularMarketPrice") or info.get("currentPrice"))
 
-    # Normalize debtToEquity if percent-like (e.g., 120 -> 1.2)
+    # Normalize debtToEquity if percent-like
     if de is not None and de > 10:
         de = de / 100.0
 
-    # Critical: treat non-positive P/B as missing (prevents fake "0.00")
-    if pb is not None and pb <= 0:
+    # ----- P/B sanity + fallback calculation -----
+    # yfinance sometimes returns tiny / wrong priceToBook values (e.g. ~0.001)
+    # If pb is missing or suspiciously low, compute pb = price / bookValue (if available)
+    if pb is None or pb < 0.1:
+        if price is not None and book_value is not None and book_value > 0:
+            pb = price / book_value
+
+    # final sanity bounds for pb
+    if pb is not None and (pb < 0.1 or pb > 20):
         pb = None
 
     earnings_yield = (1.0 / pe) if (pe and pe > 0) else None
@@ -232,7 +235,6 @@ def passes_rules(r: Dict) -> bool:
     roe = r["roe"]
     mcap = r["market_cap"]
 
-    # Require core values and reject invalid zeros
     if mcap is None or mcap < RULES["market_cap_min"]:
         return False
     if pe is None or pe <= 0 or pe > RULES["pe_max"]:
@@ -250,7 +252,7 @@ def passes_rules(r: Dict) -> bool:
     if roe is None or roe < RULES["roe_min"]:
         return False
 
-    # Extra sanity guards (reduce weird yfinance edge cases)
+    # extra sanity
     if pe > 100:
         return False
     if roe < 0 or roe > 1.5:
@@ -308,8 +310,7 @@ def main():
     all_tickers = get_sp500_tickers()
     print(f"Loaded {len(all_tickers)} tickers (pre-sample)")
 
-    # Daily random sample to avoid alphabetical bias while keeping load bounded
-    # (same sample for the same day)
+    # Daily random sample to avoid alphabetical bias
     random.seed(datetime.utcnow().strftime("%Y-%m-%d"))
     random.shuffle(all_tickers)
     tickers = all_tickers[:min(MAX_TICKERS, len(all_tickers))]
