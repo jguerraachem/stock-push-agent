@@ -1,4 +1,4 @@
-name: Daily Value Top 5
+name: Daily Value Top 5 (Free) -> Pushover
 
 on:
   
@@ -26,7 +26,6 @@ jobs:
           PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
           PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
           # Optional tuning:
-          # TOP_N: "5"
           # MAX_TICKERS: "250"
           # THREADS: "12"
           # REQUIRE_FCF: "0"
