@@ -34,15 +34,18 @@ RULES = {
     "pe_pb_max": 35.0,
     "earnings_yield_min": 0.05,
     "market_cap_min": MARKET_CAP_MIN,
+
+    # NEW: ROE floor only when ROE exists (missing allowed)
+    "roe_floor_if_present": 0.08,  # 8%
 }
 
-# Score weights
+# Score weights (quality matters more now)
 WEIGHTS = {
     "earnings_yield": 0.50,
     "low_pb": 0.20,
-    "low_de": 0.15,
-    "high_current_ratio": 0.10,  # non-financials only
-    "roe": 0.05,
+    "low_de": 0.10,
+    "high_current_ratio": 0.05,  # non-financials only
+    "roe": 0.15,                 # ↑ bigger influence
 }
 
 # =======================
@@ -211,7 +214,6 @@ def compute_metrics(ticker: str, info: Dict) -> Dict:
     sector = info.get("sector")
     industry = info.get("industry")
 
-    # Normalize debtToEquity if percent-like
     if de is not None and de > 10:
         de = de / 100.0
 
@@ -241,16 +243,12 @@ def compute_metrics(ticker: str, info: Dict) -> Dict:
     }
 
 
-# =======================
-# FILTER: HARD VALUE RULES + HARD GUARDS (if data exists)
-# =======================
 def passes_rules(r: Dict) -> bool:
     pe = r["pe"]
     pb = r["pb"]
     ey = r["earnings_yield"]
     mcap = r["market_cap"]
 
-    # Hard valuation rules
     if mcap is None or mcap < RULES["market_cap_min"]:
         return False
     if pe is None or pe <= 0 or pe > RULES["pe_max"]:
@@ -264,10 +262,13 @@ def passes_rules(r: Dict) -> bool:
     if pe > 100:
         return False
 
-    # Hard guards only if present (remove obvious junk)
+    # Guards if present
     roe = r.get("roe")
-    if roe is not None and roe < 0:
-        return False
+    if roe is not None:
+        if roe < 0:
+            return False
+        if roe < RULES["roe_floor_if_present"]:
+            return False
 
     de = r.get("debt_to_equity")
     if de is not None and de > 1.0:
@@ -281,9 +282,6 @@ def passes_rules(r: Dict) -> bool:
     return True
 
 
-# =======================
-# SCORE: SOFT METRICS + QUALITY TILT (penalize ROE < 10% if present)
-# =======================
 def score(r: Dict) -> float:
     ey = r["earnings_yield"] or 0.0
     pb = r["pb"]
@@ -294,22 +292,16 @@ def score(r: Dict) -> float:
 
     low_pb = (1.0 / pb) if (pb and pb > 0) else 0.0
 
-    # Debt score: missing -> neutral; higher debt -> lower score
     if de is None:
         low_de = 0.50
     else:
         low_de = 1.0 / (1.0 + de)
 
-    # ROE: missing -> neutral; cap to avoid wild values dominating
     if roe is None:
-        roe_score = 0.08
+        roe_score = 0.08  # neutral
     else:
         roe_score = max(0.0, min(roe, 0.30))
-        # quality tilt: if ROE exists but < 10%, penalize (no extra missingness)
-        if roe < 0.10:
-            roe_score *= 0.5
 
-    # Current ratio only for non-financials
     if fin:
         cr_score = 0.0
     else:
@@ -352,7 +344,6 @@ def main():
     all_tickers = get_sp500_tickers()
     print(f"Loaded {len(all_tickers)} tickers (pre-sample)")
 
-    # Daily random sample to avoid alphabetical bias
     random.seed(datetime.utcnow().strftime("%Y-%m-%d"))
     random.shuffle(all_tickers)
     tickers = all_tickers[:min(MAX_TICKERS, len(all_tickers))]
@@ -370,7 +361,6 @@ def main():
             info = fetch_info_with_retries(t, INFO_RETRIES)
             r = compute_metrics(tk, info)
 
-            # Core fields required for hard rules
             core_needed = ["pe", "pb", "market_cap", "earnings_yield"]
             if any(r.get(k) is None for k in core_needed):
                 missing_core += 1
@@ -406,7 +396,6 @@ def main():
         pb = r["pb"]
         fin_tag = "FIN" if r.get("is_financial") else "NON-FIN"
         sector = r.get("sector") or "—"
-
         cr_display = fmt_num(r.get("current_ratio")) if not r.get("is_financial") else "—"
 
         lines.append(
@@ -417,7 +406,10 @@ def main():
         )
 
     message = "Top 5 — Graham Modern (Free)\n" + "\n".join(lines)
-    footer = f"\nSampled:{len(tickers)} | InfoErr:{info_errors} | MissingCore:{missing_core}"
+    footer = (
+        f"\nSampled:{len(tickers)} | InfoErr:{info_errors} | MissingCore:{missing_core} | "
+        f"MCapMin:{fmt_mcap(RULES['market_cap_min'])}"
+    )
     if len(message) + len(footer) <= 1024:
         message += footer
 
