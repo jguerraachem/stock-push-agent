@@ -1,9 +1,12 @@
 import os
 import math
+import time
+from io import StringIO
+from typing import List, Dict, Optional
+
 import requests
 import pandas as pd
 import yfinance as yf
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =======================
 # SECRETS / ENV
@@ -12,36 +15,37 @@ PUSHOVER_USER_KEY = os.environ.get("PUSHOVER_USER_KEY")
 PUSHOVER_APP_TOKEN = os.environ.get("PUSHOVER_APP_TOKEN")
 
 TOP_N = int(os.environ.get("TOP_N", "5"))
-MAX_TICKERS = int(os.environ.get("MAX_TICKERS", "503"))   # baja a 200 si quieres más rápido
-THREADS = int(os.environ.get("THREADS", "10"))            # 8–16 ok
-
-# Require FCF yield or not (free data sometimes missing)
-REQUIRE_FCF = os.environ.get("REQUIRE_FCF", "0") == "1"
+MAX_TICKERS = int(os.environ.get("MAX_TICKERS", "503"))  # set 200 if you want less load
+INFO_RETRIES = int(os.environ.get("INFO_RETRIES", "2"))  # retries per ticker for yfinance info
 
 # =======================
-# GRAHAM MODERN RULES
+# "GRAHAM MODERN" RULES (practical)
 # =======================
 RULES = {
     "pe_max": 20.0,
     "pb_max": 2.5,
     "pe_pb_max": 35.0,
-    "earnings_yield_min": 0.05,
+    "earnings_yield_min": 0.05,     # 5%
     "debt_to_equity_max": 0.75,
     "current_ratio_min": 1.5,
-    "roe_min": 0.10,
-    "market_cap_min": 5e9,
-    "fcf_yield_min": 0.05,   # only used if REQUIRE_FCF=1
+    "roe_min": 0.10,                # 10%
+    "market_cap_min": 5e9,          # 5B
 }
 
 WEIGHTS = {
-    "earnings_yield": 0.45,
-    "fcf_yield": 0.25,
-    "low_pb": 0.15,
-    "low_de": 0.10,
+    "earnings_yield": 0.50,
+    "low_pb": 0.20,
+    "low_de": 0.15,
+    "high_current_ratio": 0.10,
     "roe": 0.05,
 }
 
-WIKI_SP500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+# =======================
+# Ticker sources (try in order)
+# =======================
+WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+GITHUB_DATASET_URL = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
+FALLBACK_FILE = "sp500_tickers_fallback.txt"
 
 
 def must_env():
@@ -51,7 +55,7 @@ def must_env():
     if not PUSHOVER_APP_TOKEN:
         missing.append("PUSHOVER_APP_TOKEN")
     if missing:
-        raise RuntimeError(f"Missing secrets: {', '.join(missing)}")
+        raise RuntimeError(f"Missing GitHub Secrets: {', '.join(missing)}")
 
 
 def pushover_push(title: str, message: str):
@@ -76,49 +80,91 @@ def pushover_push(title: str, message: str):
     r.raise_for_status()
 
 
-def get_sp500_symbols() -> list[str]:
-    """
-    Robust against Wikipedia 403 on GitHub runners:
-    fetch with requests + User-Agent, then parse HTML string.
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; value-agent/1.0; +https://github.com/)",
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "close",
-    }
-    resp = requests.get(WIKI_SP500, headers=headers, timeout=30)
-    resp.raise_for_status()
+def normalize_symbol(sym: str) -> str:
+    sym = (sym or "").strip().upper()
+    sym = sym.replace(".", "-")  # BRK.B -> BRK-B
+    return sym
 
-    # Parse tables from HTML string
-    tables = pd.read_html(resp.text)
-    if not tables:
-        raise RuntimeError("Could not parse Wikipedia tables for S&P 500.")
 
-    df = tables[0]
-    if "Symbol" not in df.columns:
-        found = None
+def load_tickers_from_wikipedia() -> Optional[List[str]]:
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; value-agent/1.0; +https://github.com/)",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "close",
+        }
+        resp = requests.get(WIKI_URL, headers=headers, timeout=30)
+        resp.raise_for_status()
+        tables = pd.read_html(resp.text)
+        df = None
         for t in tables:
             if "Symbol" in t.columns:
-                found = t
+                df = t
                 break
-        if found is None:
-            raise RuntimeError("Could not find 'Symbol' table on Wikipedia page.")
-        df = found
+        if df is None:
+            return None
+        syms = [normalize_symbol(s) for s in df["Symbol"].astype(str).tolist()]
+        syms = [s for s in syms if s]
+        return dedupe_preserve_order(syms)[:MAX_TICKERS]
+    except Exception as e:
+        print("Wikipedia tickers failed:", e.__class__.__name__)
+        return None
 
-    symbols = df["Symbol"].astype(str).str.upper().tolist()
-    symbols = [s.replace(".", "-").strip() for s in symbols]
 
+def load_tickers_from_github_dataset() -> Optional[List[str]]:
+    try:
+        headers = {"User-Agent": "value-agent/1.0"}
+        resp = requests.get(GITHUB_DATASET_URL, headers=headers, timeout=30)
+        resp.raise_for_status()
+        df = pd.read_csv(StringIO(resp.text))
+        if "Symbol" not in df.columns:
+            return None
+        syms = [normalize_symbol(s) for s in df["Symbol"].astype(str).tolist()]
+        syms = [s for s in syms if s]
+        return dedupe_preserve_order(syms)[:MAX_TICKERS]
+    except Exception as e:
+        print("GitHub dataset tickers failed:", e.__class__.__name__)
+        return None
+
+
+def load_tickers_from_fallback_file() -> List[str]:
+    try:
+        with open(FALLBACK_FILE, "r", encoding="utf-8") as f:
+            lines = [normalize_symbol(x) for x in f.read().splitlines()]
+        lines = [x for x in lines if x]
+        return dedupe_preserve_order(lines)[:MAX_TICKERS]
+    except FileNotFoundError:
+        return []
+
+
+def get_sp500_tickers() -> List[str]:
+    # Try multiple sources; always return something if fallback exists
+    for fn in (load_tickers_from_wikipedia, load_tickers_from_github_dataset):
+        tickers = fn()
+        if tickers:
+            return tickers
+
+    fallback = load_tickers_from_fallback_file()
+    if fallback:
+        return fallback
+
+    raise RuntimeError(
+        "Could not load S&P 500 tickers from web sources, and fallback file is missing/empty. "
+        "Create sp500_tickers_fallback.txt with one ticker per line."
+    )
+
+
+def dedupe_preserve_order(items: List[str]) -> List[str]:
     out, seen = [], set()
-    for s in symbols:
-        if s and s not in seen:
-            seen.add(s)
-            out.append(s)
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
-    return out[:MAX_TICKERS]
 
-
-def safe_float(x):
+def safe_float(x) -> Optional[float]:
     try:
         if x is None:
             return None
@@ -127,31 +173,34 @@ def safe_float(x):
         return None
 
 
-def fetch_metrics(ticker: str) -> dict:
-    """
-    Free source: yfinance .info.
-    Missing fields are common; we handle that gracefully.
-    """
-    try:
-        info = yf.Ticker(ticker).info
-    except Exception as e:
-        return {"ticker": ticker, "error": f"yfinance_error: {e.__class__.__name__}"}
+def fetch_info_with_retries(t: yf.Ticker, retries: int) -> Dict:
+    last_exc = None
+    for i in range(retries + 1):
+        try:
+            info = t.info  # may rate-limit / be incomplete
+            if isinstance(info, dict) and info:
+                return info
+        except Exception as e:
+            last_exc = e
+            # small backoff
+            time.sleep(0.6 * (i + 1))
+    raise last_exc or RuntimeError("Unknown yfinance info error")
 
+
+def compute_metrics(ticker: str, info: Dict) -> Dict:
     pe = safe_float(info.get("trailingPE") or info.get("forwardPE"))
     pb = safe_float(info.get("priceToBook"))
     mcap = safe_float(info.get("marketCap"))
     de = safe_float(info.get("debtToEquity"))
     cr = safe_float(info.get("currentRatio"))
     roe = safe_float(info.get("returnOnEquity"))
-    fcf = safe_float(info.get("freeCashflow"))
     price = safe_float(info.get("regularMarketPrice") or info.get("currentPrice"))
 
-    # normalize debtToEquity if it's percent-like
+    # Normalize debtToEquity if percent-like (e.g., 120 -> 1.2)
     if de is not None and de > 10:
         de = de / 100.0
 
-    earnings_yield = (1.0 / pe) if (pe is not None and pe > 0) else None
-    fcf_yield = (fcf / mcap) if (fcf is not None and mcap is not None and mcap > 0) else None
+    earnings_yield = (1.0 / pe) if (pe and pe > 0) else None
 
     return {
         "ticker": ticker,
@@ -163,19 +212,17 @@ def fetch_metrics(ticker: str) -> dict:
         "current_ratio": cr,
         "roe": roe,
         "earnings_yield": earnings_yield,
-        "fcf_yield": fcf_yield,
     }
 
 
-def passes_rules(r: dict) -> bool:
-    mcap = r["market_cap"]
+def passes_rules(r: Dict) -> bool:
     pe = r["pe"]
     pb = r["pb"]
     ey = r["earnings_yield"]
     de = r["debt_to_equity"]
     cr = r["current_ratio"]
     roe = r["roe"]
-    fy = r["fcf_yield"]
+    mcap = r["market_cap"]
 
     if mcap is None or mcap < RULES["market_cap_min"]:
         return False
@@ -193,49 +240,43 @@ def passes_rules(r: dict) -> bool:
         return False
     if roe is None or roe < RULES["roe_min"]:
         return False
-    if REQUIRE_FCF and (fy is None or fy < RULES["fcf_yield_min"]):
-        return False
-
     return True
 
 
-def score(r: dict) -> float:
+def score(r: Dict) -> float:
     ey = r["earnings_yield"] or 0.0
-    fy = r["fcf_yield"] or 0.0
     roe = r["roe"] or 0.0
 
     pb = r["pb"]
     de = r["debt_to_equity"]
+    cr = r["current_ratio"] or 0.0
 
-    low_pb = (1.0 / pb) if (pb is not None and pb > 0) else 0.0
+    low_pb = (1.0 / pb) if (pb and pb > 0) else 0.0
     low_de = (1.0 / (1.0 + de)) if (de is not None and de >= 0) else 0.0
+    high_cr = min(cr / 3.0, 1.0)
 
     return (
-        WEIGHTS["earnings_yield"] * ey +
-        WEIGHTS["fcf_yield"] * fy +
-        WEIGHTS["low_pb"] * low_pb +
-        WEIGHTS["low_de"] * low_de +
-        WEIGHTS["roe"] * roe
+        WEIGHTS["earnings_yield"] * ey
+        + WEIGHTS["low_pb"] * low_pb
+        + WEIGHTS["low_de"] * low_de
+        + WEIGHTS["high_current_ratio"] * high_cr
+        + WEIGHTS["roe"] * roe
     )
 
 
-def fmt_pct(x):
-    if x is None:
-        return "—"
-    if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+def fmt_pct(x: Optional[float]) -> str:
+    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
         return "—"
     return f"{x*100:.1f}%"
 
 
-def fmt_num(x):
-    if x is None:
-        return "—"
-    if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+def fmt_num(x: Optional[float]) -> str:
+    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
         return "—"
     return f"{x:.2f}"
 
 
-def fmt_mcap(x):
+def fmt_mcap(x: Optional[float]) -> str:
     if x is None:
         return "—"
     if x >= 1e12:
@@ -248,54 +289,65 @@ def fmt_mcap(x):
 def main():
     must_env()
 
-    tickers = get_sp500_symbols()
-    print(f"Loaded {len(tickers)} S&P 500 tickers (Wikipedia)")
+    tickers = get_sp500_tickers()
+    print(f"Loaded {len(tickers)} tickers")
 
-    rows = []
-    errors = 0
+    # Use yf.Tickers to reduce overhead
+    bundle = yf.Tickers(" ".join(tickers))
 
-    with ThreadPoolExecutor(max_workers=THREADS) as ex:
-        futs = {ex.submit(fetch_metrics, t): t for t in tickers}
-        for fut in as_completed(futs):
-            r = fut.result()
-            if "error" in r:
-                errors += 1
-            rows.append(r)
+    ok_rows = []
+    info_errors = 0
+    missing_data = 0
 
-    df = pd.DataFrame(rows)
-    df.to_csv("sp500_value_raw.csv", index=False)
+    for tk in tickers:
+        try:
+            t = bundle.tickers.get(tk) or yf.Ticker(tk)
+            info = fetch_info_with_retries(t, INFO_RETRIES)
+            r = compute_metrics(tk, info)
 
-    df["pass"] = df.apply(lambda x: passes_rules(x.to_dict()), axis=1)
-    passed = df[df["pass"] == True].copy()
+            # Require core fields for the screen; count missing
+            core_needed = ["pe", "pb", "market_cap", "debt_to_equity", "current_ratio", "roe", "earnings_yield"]
+            if any(r.get(k) is None for k in core_needed):
+                missing_data += 1
+                continue
 
-    if passed.empty:
+            if passes_rules(r):
+                r["score"] = score(r)
+                ok_rows.append(r)
+
+        except Exception as e:
+            info_errors += 1
+            print(f"{tk} info error: {e.__class__.__name__}")
+
+        # small pacing to be kind to the upstream
+        time.sleep(0.05)
+
+    if not ok_rows:
         msg = (
-            "No S&P 500 stocks passed Graham-Modern rules today.\n"
-            f"(REQUIRE_FCF={int(REQUIRE_FCF)}) Try relaxing thresholds or set REQUIRE_FCF=0."
+            "No candidates today (Free yfinance).\n"
+            f"Tickers loaded: {len(tickers)}\n"
+            f"Info errors: {info_errors}\n"
+            f"Missing-data skipped: {missing_data}\n"
+            "Tip: set MAX_TICKERS=200 to reduce rate limits."
         )
         pushover_push("Daily Value Top 5 (Free)", msg)
         print(msg)
         return
 
-    passed["score"] = passed.apply(lambda x: score(x.to_dict()), axis=1)
-    passed = passed.sort_values("score", ascending=False).head(TOP_N)
+    df = pd.DataFrame(ok_rows).sort_values("score", ascending=False).head(TOP_N)
 
     lines = []
-    for _, r in passed.iterrows():
-        pe = r.get("pe")
-        pb = r.get("pb")
-        pe_pb = (pe * pb) if (pe and pb) else None
-
+    for _, r in df.iterrows():
+        pe = r["pe"]; pb = r["pb"]
         lines.append(
-            f"{r['ticker']}: EY {fmt_pct(r.get('earnings_yield'))} | "
-            f"P/E {fmt_num(pe)} | P/B {fmt_num(pb)} | PExPB {fmt_num(pe_pb)} | "
-            f"FCF {fmt_pct(r.get('fcf_yield'))} | ROE {fmt_pct(r.get('roe'))} | "
-            f"D/E {fmt_num(r.get('debt_to_equity'))} | CR {fmt_num(r.get('current_ratio'))} | "
-            f"MCap {fmt_mcap(r.get('market_cap'))}"
+            f"{r['ticker']}: EY {fmt_pct(r['earnings_yield'])} | "
+            f"P/E {fmt_num(pe)} | P/B {fmt_num(pb)} | PExPB {fmt_num(pe*pb)} | "
+            f"ROE {fmt_pct(r['roe'])} | D/E {fmt_num(r['debt_to_equity'])} | "
+            f"CR {fmt_num(r['current_ratio'])} | MCap {fmt_mcap(r['market_cap'])}"
         )
 
     message = "Top 5 — Graham Modern (Free)\n" + "\n".join(lines)
-    footer = f"\nErrors: {errors}/{len(tickers)} (missing data is normal)"
+    footer = f"\nLoaded:{len(tickers)} | InfoErr:{info_errors} | SkippedMissing:{missing_data}"
     if len(message) + len(footer) <= 1024:
         message += footer
 
