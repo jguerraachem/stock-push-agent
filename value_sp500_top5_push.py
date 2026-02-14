@@ -78,6 +78,7 @@ def pushover_push(title: str, message: str):
             "user": PUSHOVER_USER_KEY.strip(),
             "title": title,
             "message": message,
+            "sound": os.environ.get("PUSHOVER_SOUND", "cashregister"),
         },
         timeout=30,
     )
