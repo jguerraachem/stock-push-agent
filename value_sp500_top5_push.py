@@ -1,6 +1,8 @@
 import os
 import math
 import time
+import random
+from datetime import datetime
 from io import StringIO
 from typing import List, Dict, Optional
 
@@ -15,8 +17,8 @@ PUSHOVER_USER_KEY = os.environ.get("PUSHOVER_USER_KEY")
 PUSHOVER_APP_TOKEN = os.environ.get("PUSHOVER_APP_TOKEN")
 
 TOP_N = int(os.environ.get("TOP_N", "5"))
-MAX_TICKERS = int(os.environ.get("MAX_TICKERS", "503"))  # set 200 if you want less load
-INFO_RETRIES = int(os.environ.get("INFO_RETRIES", "2"))  # retries per ticker for yfinance info
+MAX_TICKERS = int(os.environ.get("MAX_TICKERS", "200"))   # keep 200 for reliability
+INFO_RETRIES = int(os.environ.get("INFO_RETRIES", "2"))   # retries per ticker for yfinance info
 
 # =======================
 # "GRAHAM MODERN" RULES (practical)
@@ -86,6 +88,15 @@ def normalize_symbol(sym: str) -> str:
     return sym
 
 
+def dedupe_preserve_order(items: List[str]) -> List[str]:
+    out, seen = [], set()
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
 def load_tickers_from_wikipedia() -> Optional[List[str]]:
     try:
         headers = {
@@ -97,6 +108,7 @@ def load_tickers_from_wikipedia() -> Optional[List[str]]:
         resp = requests.get(WIKI_URL, headers=headers, timeout=30)
         resp.raise_for_status()
         tables = pd.read_html(resp.text)
+
         df = None
         for t in tables:
             if "Symbol" in t.columns:
@@ -104,9 +116,10 @@ def load_tickers_from_wikipedia() -> Optional[List[str]]:
                 break
         if df is None:
             return None
+
         syms = [normalize_symbol(s) for s in df["Symbol"].astype(str).tolist()]
         syms = [s for s in syms if s]
-        return dedupe_preserve_order(syms)[:MAX_TICKERS]
+        return dedupe_preserve_order(syms)
     except Exception as e:
         print("Wikipedia tickers failed:", e.__class__.__name__)
         return None
@@ -118,11 +131,13 @@ def load_tickers_from_github_dataset() -> Optional[List[str]]:
         resp = requests.get(GITHUB_DATASET_URL, headers=headers, timeout=30)
         resp.raise_for_status()
         df = pd.read_csv(StringIO(resp.text))
+
         if "Symbol" not in df.columns:
             return None
+
         syms = [normalize_symbol(s) for s in df["Symbol"].astype(str).tolist()]
         syms = [s for s in syms if s]
-        return dedupe_preserve_order(syms)[:MAX_TICKERS]
+        return dedupe_preserve_order(syms)
     except Exception as e:
         print("GitHub dataset tickers failed:", e.__class__.__name__)
         return None
@@ -133,13 +148,12 @@ def load_tickers_from_fallback_file() -> List[str]:
         with open(FALLBACK_FILE, "r", encoding="utf-8") as f:
             lines = [normalize_symbol(x) for x in f.read().splitlines()]
         lines = [x for x in lines if x]
-        return dedupe_preserve_order(lines)[:MAX_TICKERS]
+        return dedupe_preserve_order(lines)
     except FileNotFoundError:
         return []
 
 
 def get_sp500_tickers() -> List[str]:
-    # Try multiple sources; always return something if fallback exists
     for fn in (load_tickers_from_wikipedia, load_tickers_from_github_dataset):
         tickers = fn()
         if tickers:
@@ -155,15 +169,6 @@ def get_sp500_tickers() -> List[str]:
     )
 
 
-def dedupe_preserve_order(items: List[str]) -> List[str]:
-    out, seen = [], set()
-    for x in items:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
-
-
 def safe_float(x) -> Optional[float]:
     try:
         if x is None:
@@ -177,12 +182,11 @@ def fetch_info_with_retries(t: yf.Ticker, retries: int) -> Dict:
     last_exc = None
     for i in range(retries + 1):
         try:
-            info = t.info  # may rate-limit / be incomplete
+            info = t.info
             if isinstance(info, dict) and info:
                 return info
         except Exception as e:
             last_exc = e
-            # small backoff
             time.sleep(0.6 * (i + 1))
     raise last_exc or RuntimeError("Unknown yfinance info error")
 
@@ -199,6 +203,10 @@ def compute_metrics(ticker: str, info: Dict) -> Dict:
     # Normalize debtToEquity if percent-like (e.g., 120 -> 1.2)
     if de is not None and de > 10:
         de = de / 100.0
+
+    # Critical: treat non-positive P/B as missing (prevents fake "0.00")
+    if pb is not None and pb <= 0:
+        pb = None
 
     earnings_yield = (1.0 / pe) if (pe and pe > 0) else None
 
@@ -224,6 +232,7 @@ def passes_rules(r: Dict) -> bool:
     roe = r["roe"]
     mcap = r["market_cap"]
 
+    # Require core values and reject invalid zeros
     if mcap is None or mcap < RULES["market_cap_min"]:
         return False
     if pe is None or pe <= 0 or pe > RULES["pe_max"]:
@@ -240,6 +249,13 @@ def passes_rules(r: Dict) -> bool:
         return False
     if roe is None or roe < RULES["roe_min"]:
         return False
+
+    # Extra sanity guards (reduce weird yfinance edge cases)
+    if pe > 100:
+        return False
+    if roe < 0 or roe > 1.5:
+        return False
+
     return True
 
 
@@ -289,10 +305,16 @@ def fmt_mcap(x: Optional[float]) -> str:
 def main():
     must_env()
 
-    tickers = get_sp500_tickers()
-    print(f"Loaded {len(tickers)} tickers")
+    all_tickers = get_sp500_tickers()
+    print(f"Loaded {len(all_tickers)} tickers (pre-sample)")
 
-    # Use yf.Tickers to reduce overhead
+    # Daily random sample to avoid alphabetical bias while keeping load bounded
+    # (same sample for the same day)
+    random.seed(datetime.utcnow().strftime("%Y-%m-%d"))
+    random.shuffle(all_tickers)
+    tickers = all_tickers[:min(MAX_TICKERS, len(all_tickers))]
+    print(f"Sampling {len(tickers)} tickers for today (MAX_TICKERS={MAX_TICKERS})")
+
     bundle = yf.Tickers(" ".join(tickers))
 
     ok_rows = []
@@ -305,7 +327,6 @@ def main():
             info = fetch_info_with_retries(t, INFO_RETRIES)
             r = compute_metrics(tk, info)
 
-            # Require core fields for the screen; count missing
             core_needed = ["pe", "pb", "market_cap", "debt_to_equity", "current_ratio", "roe", "earnings_yield"]
             if any(r.get(k) is None for k in core_needed):
                 missing_data += 1
@@ -319,16 +340,15 @@ def main():
             info_errors += 1
             print(f"{tk} info error: {e.__class__.__name__}")
 
-        # small pacing to be kind to the upstream
         time.sleep(0.05)
 
     if not ok_rows:
         msg = (
             "No candidates today (Free yfinance).\n"
-            f"Tickers loaded: {len(tickers)}\n"
+            f"Tickers sampled: {len(tickers)}\n"
             f"Info errors: {info_errors}\n"
             f"Missing-data skipped: {missing_data}\n"
-            "Tip: set MAX_TICKERS=200 to reduce rate limits."
+            "Tip: reduce MAX_TICKERS or relax thresholds."
         )
         pushover_push("Daily Value Top 5 (Free)", msg)
         print(msg)
@@ -338,7 +358,8 @@ def main():
 
     lines = []
     for _, r in df.iterrows():
-        pe = r["pe"]; pb = r["pb"]
+        pe = r["pe"]
+        pb = r["pb"]
         lines.append(
             f"{r['ticker']}: EY {fmt_pct(r['earnings_yield'])} | "
             f"P/E {fmt_num(pe)} | P/B {fmt_num(pb)} | PExPB {fmt_num(pe*pb)} | "
@@ -347,7 +368,7 @@ def main():
         )
 
     message = "Top 5 — Graham Modern (Free)\n" + "\n".join(lines)
-    footer = f"\nLoaded:{len(tickers)} | InfoErr:{info_errors} | SkippedMissing:{missing_data}"
+    footer = f"\nSampled:{len(tickers)} | InfoErr:{info_errors} | SkippedMissing:{missing_data}"
     if len(message) + len(footer) <= 1024:
         message += footer
 
