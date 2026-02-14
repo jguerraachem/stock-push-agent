@@ -20,9 +20,9 @@ TOP_N = int(os.environ.get("TOP_N", "5"))
 MAX_TICKERS = int(os.environ.get("MAX_TICKERS", "200"))
 INFO_RETRIES = int(os.environ.get("INFO_RETRIES", "2"))
 
-# Optional: raise quality by requiring larger companies
-# Set via env if you want: MARKET_CAP_MIN=10000000000
-MARKET_CAP_MIN = float(os.environ.get("MARKET_CAP_MIN", "5000000000"))
+# Raise quality: default market-cap floor is now 10B
+# You can still override via workflow env MARKET_CAP_MIN
+MARKET_CAP_MIN = float(os.environ.get("MARKET_CAP_MIN", "10000000000"))  # 10B
 
 # =======================
 # "GRAHAM MODERN" RULES
@@ -35,17 +35,18 @@ RULES = {
     "earnings_yield_min": 0.05,
     "market_cap_min": MARKET_CAP_MIN,
 
-    # NEW: ROE floor only when ROE exists (missing allowed)
-    "roe_floor_if_present": 0.08,  # 8%
+    # ROE floors (only enforced when ROE exists; missing ROE is allowed)
+    "roe_floor_nonfin_if_present": 0.08,  # 8%
+    "roe_floor_fin_if_present": 0.10,     # 10% for Financials
 }
 
-# Score weights (quality matters more now)
+# Score weights (quality tilt)
 WEIGHTS = {
     "earnings_yield": 0.50,
     "low_pb": 0.20,
     "low_de": 0.10,
     "high_current_ratio": 0.05,  # non-financials only
-    "roe": 0.15,                 # ↑ bigger influence
+    "roe": 0.15,
 }
 
 # =======================
@@ -214,6 +215,7 @@ def compute_metrics(ticker: str, info: Dict) -> Dict:
     sector = info.get("sector")
     industry = info.get("industry")
 
+    # Normalize debtToEquity if percent-like
     if de is not None and de > 10:
         de = de / 100.0
 
@@ -262,19 +264,21 @@ def passes_rules(r: Dict) -> bool:
     if pe > 100:
         return False
 
+    fin = bool(r.get("is_financial", False))
+
     # Guards if present
     roe = r.get("roe")
     if roe is not None:
         if roe < 0:
             return False
-        if roe < RULES["roe_floor_if_present"]:
+        floor = RULES["roe_floor_fin_if_present"] if fin else RULES["roe_floor_nonfin_if_present"]
+        if roe < floor:
             return False
 
     de = r.get("debt_to_equity")
     if de is not None and de > 1.0:
         return False
 
-    fin = bool(r.get("is_financial", False))
     cr = r.get("current_ratio")
     if not fin and cr is not None and cr < 1.0:
         return False
@@ -298,7 +302,7 @@ def score(r: Dict) -> float:
         low_de = 1.0 / (1.0 + de)
 
     if roe is None:
-        roe_score = 0.08  # neutral
+        roe_score = 0.08
     else:
         roe_score = max(0.0, min(roe, 0.30))
 
@@ -408,7 +412,7 @@ def main():
     message = "Top 5 — Graham Modern (Free)\n" + "\n".join(lines)
     footer = (
         f"\nSampled:{len(tickers)} | InfoErr:{info_errors} | MissingCore:{missing_core} | "
-        f"MCapMin:{fmt_mcap(RULES['market_cap_min'])}"
+        f"MCapMin:{fmt_mcap(RULES['market_cap_min'])} | ROE(FIN):10% | ROE(NON):8%"
     )
     if len(message) + len(footer) <= 1024:
         message += footer
