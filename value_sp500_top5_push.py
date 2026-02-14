@@ -20,6 +20,10 @@ TOP_N = int(os.environ.get("TOP_N", "5"))
 MAX_TICKERS = int(os.environ.get("MAX_TICKERS", "200"))
 INFO_RETRIES = int(os.environ.get("INFO_RETRIES", "2"))
 
+# Optional: raise quality by requiring larger companies
+# Set via env if you want: MARKET_CAP_MIN=10000000000
+MARKET_CAP_MIN = float(os.environ.get("MARKET_CAP_MIN", "5000000000"))
+
 # =======================
 # "GRAHAM MODERN" RULES
 # =======================
@@ -29,7 +33,7 @@ RULES = {
     "pb_max": 2.5,
     "pe_pb_max": 35.0,
     "earnings_yield_min": 0.05,
-    "market_cap_min": 5e9,
+    "market_cap_min": MARKET_CAP_MIN,
 }
 
 # Score weights
@@ -260,7 +264,7 @@ def passes_rules(r: Dict) -> bool:
     if pe > 100:
         return False
 
-    # Hard guards only if present (reduces "junk" like negative ROE)
+    # Hard guards only if present (remove obvious junk)
     roe = r.get("roe")
     if roe is not None and roe < 0:
         return False
@@ -278,7 +282,7 @@ def passes_rules(r: Dict) -> bool:
 
 
 # =======================
-# SCORE: SOFT METRICS (penalize missing / weaker quality)
+# SCORE: SOFT METRICS + QUALITY TILT (penalize ROE < 10% if present)
 # =======================
 def score(r: Dict) -> float:
     ey = r["earnings_yield"] or 0.0
@@ -301,6 +305,9 @@ def score(r: Dict) -> float:
         roe_score = 0.08
     else:
         roe_score = max(0.0, min(roe, 0.30))
+        # quality tilt: if ROE exists but < 10%, penalize (no extra missingness)
+        if roe < 0.10:
+            roe_score *= 0.5
 
     # Current ratio only for non-financials
     if fin:
