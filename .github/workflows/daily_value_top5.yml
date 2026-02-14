@@ -25,9 +25,8 @@ jobs:
         env:
           PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
           PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
-          # Optional tuning:
-          # MAX_TICKERS: "250"
-          # THREADS: "12"
-          # REQUIRE_FCF: "0"
+          # Tuning knobs to reduce failures:
+          MAX_TICKERS: "200"
+          INFO_RETRIES: "2"
         run: |
           python value_sp500_top5_push.py
