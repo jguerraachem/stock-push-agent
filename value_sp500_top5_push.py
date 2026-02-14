@@ -24,20 +24,15 @@ INFO_RETRIES = int(os.environ.get("INFO_RETRIES", "2"))
 # "GRAHAM MODERN" RULES
 # =======================
 RULES = {
-    # Hard constraints (still enforced)
+    # Hard valuation constraints
     "pe_max": 20.0,
     "pb_max": 2.5,
     "pe_pb_max": 35.0,
     "earnings_yield_min": 0.05,
     "market_cap_min": 5e9,
-
-    # Soft targets (used for scoring / penalties, not hard rejects)
-    "debt_to_equity_target": 0.75,
-    "current_ratio_target": 1.5,  # ignored for financials
-    "roe_target": 0.10,
 }
 
-# Score weights (sum doesn't need to be 1)
+# Score weights
 WEIGHTS = {
     "earnings_yield": 0.50,
     "low_pb": 0.20,
@@ -243,7 +238,7 @@ def compute_metrics(ticker: str, info: Dict) -> Dict:
 
 
 # =======================
-# FILTER: HARD RULES ONLY (reduce SkippedMissing)
+# FILTER: HARD VALUE RULES + HARD GUARDS (if data exists)
 # =======================
 def passes_rules(r: Dict) -> bool:
     pe = r["pe"]
@@ -251,6 +246,7 @@ def passes_rules(r: Dict) -> bool:
     ey = r["earnings_yield"]
     mcap = r["market_cap"]
 
+    # Hard valuation rules
     if mcap is None or mcap < RULES["market_cap_min"]:
         return False
     if pe is None or pe <= 0 or pe > RULES["pe_max"]:
@@ -261,34 +257,52 @@ def passes_rules(r: Dict) -> bool:
         return False
     if ey is None or ey < RULES["earnings_yield_min"]:
         return False
-
-    # sanity
     if pe > 100:
+        return False
+
+    # Hard guards only if present (reduces "junk" like negative ROE)
+    roe = r.get("roe")
+    if roe is not None and roe < 0:
+        return False
+
+    de = r.get("debt_to_equity")
+    if de is not None and de > 1.0:
+        return False
+
+    fin = bool(r.get("is_financial", False))
+    cr = r.get("current_ratio")
+    if not fin and cr is not None and cr < 1.0:
         return False
 
     return True
 
 
 # =======================
-# SCORE: SOFT METRICS (penalize missing)
+# SCORE: SOFT METRICS (penalize missing / weaker quality)
 # =======================
 def score(r: Dict) -> float:
     ey = r["earnings_yield"] or 0.0
     pb = r["pb"]
-    de = r["debt_to_equity"]
-    cr = r["current_ratio"]
-    roe = r["roe"]
+    de = r.get("debt_to_equity")
+    cr = r.get("current_ratio")
+    roe = r.get("roe")
     fin = bool(r.get("is_financial", False))
 
-    # core value signals
     low_pb = (1.0 / pb) if (pb and pb > 0) else 0.0
-    low_de = (1.0 / (1.0 + de)) if (de is not None and de >= 0) else 0.0
 
-    # Soft defaults if missing:
-    # - ROE missing -> small neutral value (not zero)
-    roe_score = roe if (roe is not None and roe > 0 and roe < 2.0) else 0.05
+    # Debt score: missing -> neutral; higher debt -> lower score
+    if de is None:
+        low_de = 0.50
+    else:
+        low_de = 1.0 / (1.0 + de)
 
-    # - Current ratio only meaningful for non-financials
+    # ROE: missing -> neutral; cap to avoid wild values dominating
+    if roe is None:
+        roe_score = 0.08
+    else:
+        roe_score = max(0.0, min(roe, 0.30))
+
+    # Current ratio only for non-financials
     if fin:
         cr_score = 0.0
     else:
@@ -349,7 +363,7 @@ def main():
             info = fetch_info_with_retries(t, INFO_RETRIES)
             r = compute_metrics(tk, info)
 
-            # CORE fields required for hard rules
+            # Core fields required for hard rules
             core_needed = ["pe", "pb", "market_cap", "earnings_yield"]
             if any(r.get(k) is None for k in core_needed):
                 missing_core += 1
@@ -386,7 +400,6 @@ def main():
         fin_tag = "FIN" if r.get("is_financial") else "NON-FIN"
         sector = r.get("sector") or "—"
 
-        # For FIN, CR not meaningful -> show "—"
         cr_display = fmt_num(r.get("current_ratio")) if not r.get("is_financial") else "—"
 
         lines.append(
