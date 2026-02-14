@@ -1,21 +1,24 @@
 import os
+import math
+import time
 import requests
 import pandas as pd
+import yfinance as yf
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =======================
-# ENV / SECRETS (GitHub)
+# SECRETS / ENV
 # =======================
-FMP_API_KEY = os.environ.get("FMP_API_KEY")
 PUSHOVER_USER_KEY = os.environ.get("PUSHOVER_USER_KEY")
 PUSHOVER_APP_TOKEN = os.environ.get("PUSHOVER_APP_TOKEN")
 
-# Optional: push formatting
-PUSH_TITLE = os.environ.get("PUSH_TITLE", "Daily Value Top 5 (Graham Modern)")
-PUSH_PRIORITY = os.environ.get("PUSH_PRIORITY", None)  # e.g. "1"
-PUSH_SOUND = os.environ.get("PUSH_SOUND", None)        # e.g. "cashregister"
+# Optional knobs
+TOP_N = int(os.environ.get("TOP_N", "5"))
+MAX_TICKERS = int(os.environ.get("MAX_TICKERS", "503"))  # set 200 if you want it faster
+THREADS = int(os.environ.get("THREADS", "10"))           # 8–16 usually ok
 
-FMP_BASE = "https://financialmodelingprep.com/stable"  # stable endpoints
-
+# If 1, require FCF yield to be present and >= min. If 0, treat missing FCF as neutral.
+REQUIRE_FCF = os.environ.get("REQUIRE_FCF", "0") == "1"
 
 # =======================
 # GRAHAM MODERN RULES
@@ -23,70 +26,53 @@ FMP_BASE = "https://financialmodelingprep.com/stable"  # stable endpoints
 RULES = {
     "pe_max": 20.0,
     "pb_max": 2.5,
-    "pe_pb_max": 35.0,          # modernized "22.5"
-    "earnings_yield_min": 0.05, # 5%
+    "pe_pb_max": 35.0,           # modernized 22.5
+    "earnings_yield_min": 0.05,  # 5%
     "debt_to_equity_max": 0.75,
     "current_ratio_min": 1.5,
-    "roe_min": 0.10,            # 10%
-    "market_cap_min": 5e9,      # 5B
+    "roe_min": 0.10,             # 10%
+    "market_cap_min": 5e9,       # 5B
+    "fcf_yield_min": 0.05,       # 5% (if REQUIRE_FCF=1)
 }
 
-# Score weights (tweakable)
+# Score weights (ranking)
 WEIGHTS = {
     "earnings_yield": 0.45,
-    "low_pb": 0.20,
-    "low_de": 0.15,
-    "high_current_ratio": 0.10,
-    "roe": 0.10,
+    "fcf_yield": 0.25,           # if missing, becomes 0 unless REQUIRE_FCF=0 (we keep 0)
+    "low_pb": 0.15,
+    "low_de": 0.10,
+    "roe": 0.05,
 }
 
-TOP_N = 5
+# Wikipedia page for S&P 500 constituents
+WIKI_SP500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 
 
-def require_env():
+def must_env():
     missing = []
-    if not FMP_API_KEY:
-        missing.append("FMP_API_KEY")
     if not PUSHOVER_USER_KEY:
         missing.append("PUSHOVER_USER_KEY")
     if not PUSHOVER_APP_TOKEN:
         missing.append("PUSHOVER_APP_TOKEN")
     if missing:
-        raise RuntimeError(f"Missing env vars/secrets: {', '.join(missing)}")
-
-
-def fmp_get(path: str, params=None):
-    if params is None:
-        params = {}
-    params = {**params, "apikey": FMP_API_KEY}
-    url = f"{FMP_BASE}{path}"
-    r = requests.get(url, params=params, timeout=60)
-    r.raise_for_status()
-    return r.json()
+        raise RuntimeError(f"Missing secrets: {', '.join(missing)}")
 
 
 def pushover_push(title: str, message: str):
     title = (title or "").strip()[:100]
-    message = (message or "").strip()[:1024]  # Pushover limit safety
-
-    data = {
-        "token": PUSHOVER_APP_TOKEN.strip(),
-        "user": PUSHOVER_USER_KEY.strip(),
-        "title": title,
-        "message": message,
-    }
-    if PUSH_PRIORITY is not None:
-        data["priority"] = str(PUSH_PRIORITY).strip()
-    if PUSH_SOUND is not None:
-        data["sound"] = str(PUSH_SOUND).strip()
+    message = (message or "").strip()[:1024]  # pushover limit
 
     r = requests.post(
         "https://api.pushover.net/1/messages.json",
-        data=data,
+        data={
+            "token": PUSHOVER_APP_TOKEN.strip(),
+            "user": PUSHOVER_USER_KEY.strip(),
+            "title": title,
+            "message": message,
+        },
         timeout=30,
     )
 
-    # Helpful debug if something goes wrong in GitHub Actions logs
     if r.status_code != 200:
         print("Pushover HTTP:", r.status_code)
         print("Pushover body:", r.text)
@@ -94,80 +80,94 @@ def pushover_push(title: str, message: str):
     r.raise_for_status()
 
 
-def to_float(x):
+def get_sp500_symbols() -> list[str]:
+    # Read constituents table from Wikipedia
+    tables = pd.read_html(WIKI_SP500)
+    if not tables:
+        raise RuntimeError("Could not read Wikipedia tables for S&P 500.")
+
+    # The first table is typically the constituents with 'Symbol'
+    df = tables[0]
+    if "Symbol" not in df.columns:
+        # Try to find the table that contains Symbol
+        found = None
+        for t in tables:
+            if "Symbol" in t.columns:
+                found = t
+                break
+        if found is None:
+            raise RuntimeError("Could not find 'Symbol' column in Wikipedia tables.")
+        df = found
+
+    symbols = df["Symbol"].astype(str).str.upper().tolist()
+
+    # Normalize for yfinance: BRK.B -> BRK-B, BF.B -> BF-B, etc.
+    symbols = [s.replace(".", "-") for s in symbols]
+
+    # Remove empties, dedupe, preserve order
+    out = []
+    seen = set()
+    for s in symbols:
+        s = s.strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+
+    return out[:MAX_TICKERS]
+
+
+def safe_float(x):
     try:
         if x is None:
             return None
+        # yfinance sometimes returns numpy types
         return float(x)
     except Exception:
         return None
 
 
-def load_sp500_symbols() -> set[str]:
+def fetch_metrics(ticker: str) -> dict:
     """
-    FMP stable endpoint for S&P 500 constituents.
+    Uses yfinance .info. This is free but not perfect; missing data is common.
     """
-    data = fmp_get("/sp500-constituent")
-    syms = set()
-    for row in data:
-        s = row.get("symbol") or row.get("ticker") or row.get("Symbol")
-        if s:
-            # normalize BRK.B -> BRK-B
-            syms.add(str(s).upper().replace(".", "-"))
-    if not syms:
-        raise RuntimeError("No S&P 500 symbols returned. Check FMP endpoint/plan.")
-    return syms
+    try:
+        info = yf.Ticker(ticker).info
+    except Exception as e:
+        return {"ticker": ticker, "error": f"yfinance_error: {e.__class__.__name__}"}
 
+    pe = safe_float(info.get("trailingPE") or info.get("forwardPE"))
+    pb = safe_float(info.get("priceToBook"))
+    mcap = safe_float(info.get("marketCap"))
+    de = safe_float(info.get("debtToEquity"))  # often in % terms? yfinance typically returns numeric ratio or percent-like
+    cr = safe_float(info.get("currentRatio"))
+    roe = safe_float(info.get("returnOnEquity"))  # often decimal (0.15 = 15%)
+    fcf = safe_float(info.get("freeCashflow"))     # absolute dollars
+    price = safe_float(info.get("regularMarketPrice") or info.get("currentPrice"))
 
-def load_key_metrics_bulk() -> pd.DataFrame:
-    """
-    Bulk key metrics TTM dataset for many symbols.
-    We'll filter to S&P 500 after loading.
-    """
-    data = fmp_get("/key-metrics-ttm-bulk")
-    if not isinstance(data, list) or len(data) == 0:
-        raise RuntimeError("No data from key-metrics-ttm-bulk. Check plan/limits.")
-    return pd.DataFrame(data)
+    # Normalize debtToEquity: yfinance sometimes uses "percent" style (e.g., 120.0 means 1.20)
+    # Heuristic: if > 10, assume it's percent and divide by 100.
+    if de is not None and de > 10:
+        de = de / 100.0
 
+    earnings_yield = (1.0 / pe) if (pe is not None and pe > 0) else None
+    fcf_yield = (fcf / mcap) if (fcf is not None and mcap is not None and mcap > 0) else None
 
-def pick_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Resilient mapping: FMP field names can vary.
-    Create standardized columns even if source keys differ.
-    """
-    def first_existing(*names):
-        for n in names:
-            if n in df.columns:
-                return n
-        return None
-
-    symbol_col = first_existing("symbol", "Symbol", "ticker")
-    if not symbol_col:
-        raise RuntimeError("Bulk dataset missing symbol column.")
-
-    colmap = {
-        "symbol": symbol_col,
-        "pe": first_existing("peRatioTTM", "peRatio", "pe"),
-        "pb": first_existing("pbRatioTTM", "priceToBookRatioTTM", "pbRatio", "pb"),
-        "earnings_yield": first_existing("earningsYieldTTM", "earningsYield"),
-        "roe": first_existing("roeTTM", "returnOnEquityTTM", "roe"),
-        "debt_to_equity": first_existing("debtToEquityTTM", "debtToEquity", "debtEquityRatioTTM", "debtEquityRatio"),
-        "current_ratio": first_existing("currentRatioTTM", "currentRatio"),
-        "market_cap": first_existing("marketCapTTM", "marketCap"),
+    return {
+        "ticker": ticker,
+        "price": price,
+        "market_cap": mcap,
+        "pe": pe,
+        "pb": pb,
+        "debt_to_equity": de,
+        "current_ratio": cr,
+        "roe": roe,
+        "earnings_yield": earnings_yield,
+        "fcf_yield": fcf_yield,
     }
 
-    out = pd.DataFrame()
-    out["symbol"] = df[colmap["symbol"]].astype(str).str.upper().str.replace(".", "-", regex=False)
 
-    for k, src in colmap.items():
-        if k == "symbol":
-            continue
-        out[k] = df[src].map(to_float) if src else None
-
-    return out
-
-
-def passes_rules(r: pd.Series) -> bool:
+def passes_rules(r: dict) -> bool:
     mcap = r["market_cap"]
     pe = r["pe"]
     pb = r["pb"]
@@ -175,6 +175,7 @@ def passes_rules(r: pd.Series) -> bool:
     de = r["debt_to_equity"]
     cr = r["current_ratio"]
     roe = r["roe"]
+    fy = r["fcf_yield"]
 
     if mcap is None or mcap < RULES["market_cap_min"]:
         return False
@@ -185,7 +186,6 @@ def passes_rules(r: pd.Series) -> bool:
     if pb is None or pb <= 0 or pb > RULES["pb_max"]:
         return False
 
-    # Graham-style combined valuation constraint (modernized)
     if (pe * pb) > RULES["pe_pb_max"]:
         return False
 
@@ -201,32 +201,43 @@ def passes_rules(r: pd.Series) -> bool:
     if roe is None or roe < RULES["roe_min"]:
         return False
 
+    if REQUIRE_FCF:
+        if fy is None or fy < RULES["fcf_yield_min"]:
+            return False
+
     return True
 
 
-def score(r: pd.Series) -> float:
+def score(r: dict) -> float:
     ey = r["earnings_yield"] or 0.0
+    fy = r["fcf_yield"] or 0.0
     roe = r["roe"] or 0.0
 
-    low_pb = (1.0 / r["pb"]) if (r["pb"] and r["pb"] > 0) else 0.0
-    low_de = (1.0 / (1.0 + r["debt_to_equity"])) if (r["debt_to_equity"] is not None and r["debt_to_equity"] >= 0) else 0.0
-    high_cr = min((r["current_ratio"] or 0.0) / 3.0, 1.0)  # cap at ~3
+    pb = r["pb"]
+    de = r["debt_to_equity"]
+
+    low_pb = (1.0 / pb) if (pb is not None and pb > 0) else 0.0
+    low_de = (1.0 / (1.0 + de)) if (de is not None and de >= 0) else 0.0
 
     return (
         WEIGHTS["earnings_yield"] * ey +
+        WEIGHTS["fcf_yield"] * fy +
         WEIGHTS["low_pb"] * low_pb +
         WEIGHTS["low_de"] * low_de +
-        WEIGHTS["high_current_ratio"] * high_cr +
         WEIGHTS["roe"] * roe
     )
 
 
 def fmt_pct(x):
-    return "—" if x is None else f"{x*100:.1f}%"
+    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+        return "—"
+    return f"{x*100:.1f}%"
 
 
 def fmt_num(x):
-    return "—" if x is None else f"{x:.2f}"
+    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+        return "—"
+    return f"{x:.2f}"
 
 
 def fmt_mcap(x):
@@ -236,54 +247,70 @@ def fmt_mcap(x):
         return f"{x/1e12:.2f}T"
     if x >= 1e9:
         return f"{x/1e9:.2f}B"
-    if x >= 1e6:
-        return f"{x/1e6:.2f}M"
-    return f"{x:.0f}"
+    return f"{x/1e6:.0f}M"
 
 
 def main():
-    require_env()
+    must_env()
 
-    sp500 = load_sp500_symbols()
-    bulk = load_key_metrics_bulk()
-    df = pick_cols(bulk)
+    tickers = get_sp500_symbols()
+    print(f"Loaded {len(tickers)} S&P 500 tickers from Wikipedia")
 
-    # filter to S&P 500
-    df = df[df["symbol"].isin(sp500)].copy()
+    rows = []
+    errors = 0
 
-    if df.empty:
-        raise RuntimeError("After filtering to S&P 500, no rows remain. Check symbol normalization.")
+    # Parallel fetch to speed up in GitHub Actions
+    with ThreadPoolExecutor(max_workers=THREADS) as ex:
+        futures = {ex.submit(fetch_metrics, t): t for t in tickers}
+        for fut in as_completed(futures):
+            r = fut.result()
+            if "error" in r:
+                errors += 1
+            rows.append(r)
 
-    df["pass"] = df.apply(passes_rules, axis=1)
-    screened = df[df["pass"] == True].copy()
+    df = pd.DataFrame(rows)
 
-    if screened.empty:
+    # Save artifacts (optional)
+    df.to_csv("sp500_value_raw.csv", index=False)
+
+    # Apply rules
+    df["pass"] = df.apply(lambda x: passes_rules(x.to_dict()), axis=1)
+    passed = df[df["pass"] == True].copy()
+
+    if passed.empty:
         msg = (
-            "No S&P 500 stocks passed today's Graham-Modern rules.\n"
-            "Tip: relax thresholds (P/E, P/B, D/E, Current Ratio) if you want more hits."
+            "No S&P 500 stocks passed Graham-Modern rules today.\n"
+            f"(REQUIRE_FCF={int(REQUIRE_FCF)}) Consider relaxing: P/E, P/B, D/E, Current Ratio."
         )
-        pushover_push(PUSH_TITLE, msg)
+        pushover_push("Daily Value Top 5 (Free)", msg)
         print(msg)
         return
 
-    screened["score"] = screened.apply(score, axis=1)
-    screened = screened.sort_values("score", ascending=False).head(TOP_N)
+    passed["score"] = passed.apply(lambda x: score(x.to_dict()), axis=1)
+    passed = passed.sort_values("score", ascending=False).head(TOP_N)
 
     lines = []
-    for _, r in screened.iterrows():
-        pe = r["pe"]
-        pb = r["pb"]
-        pe_pb = (pe * pb) if (pe is not None and pb is not None) else None
+    for _, r in passed.iterrows():
+        pe = r.get("pe")
+        pb = r.get("pb")
+        pe_pb = (pe * pb) if (pe and pb) else None
 
         lines.append(
-            f"{r['symbol']}: EY {fmt_pct(r['earnings_yield'])} | "
+            f"{r['ticker']}: EY {fmt_pct(r.get('earnings_yield'))} | "
             f"P/E {fmt_num(pe)} | P/B {fmt_num(pb)} | PExPB {fmt_num(pe_pb)} | "
-            f"ROE {fmt_pct(r['roe'])} | D/E {fmt_num(r['debt_to_equity'])} | "
-            f"CR {fmt_num(r['current_ratio'])} | MCap {fmt_mcap(r['market_cap'])}"
+            f"FCF {fmt_pct(r.get('fcf_yield'))} | ROE {fmt_pct(r.get('roe'))} | "
+            f"D/E {fmt_num(r.get('debt_to_equity'))} | CR {fmt_num(r.get('current_ratio'))} | "
+            f"MCap {fmt_mcap(r.get('market_cap'))}"
         )
 
-    message = "Top 5 — Graham Modern (S&P 500)\n" + "\n".join(lines)
-    pushover_push(PUSH_TITLE, message)
+    header = f"Top {TOP_N} — Graham Modern (Free)"
+    footer = f"\nErrors: {errors}/{len(tickers)} (missing data is normal on free sources)"
+    message = header + "\n" + "\n".join(lines)
+    # stay under 1024 chars
+    if len(message) + len(footer) <= 1024:
+        message += footer
+
+    pushover_push("Daily Value Top 5 (Free)", message)
     print(message)
 
 
