@@ -8,7 +8,7 @@ import pandas_market_calendars as mcal
 # =======================
 # CONFIG
 # =======================
-TICKERS = ["QQQM", "MAGS", "IBIT", "AMZN", "V", "GLDM", "VOO", "JEPQ", "O", "MCD", "VYM", "VTI"]
+TICKERS = ["QQQM", "MAGS", "IBIT", "AMZN", "V", "GLDM", "VOO", "JEPQ", "O", "MCD", "VYM", "VTI", "ELV"]
 
 # Pushover env vars (set these as GitHub Actions Secrets)
 PUSHOVER_USER_KEY = os.environ.get("PUSHOVER_USER_KEY")
