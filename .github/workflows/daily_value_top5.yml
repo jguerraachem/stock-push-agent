@@ -2,7 +2,7 @@ name: Daily Value Top 5 (Free) -> Pushover
 
 on:
   schedule:
-    - cron: "0 0 * * *"   # 00:00 UTC = 18:00 America/Monterrey
+    - cron: "0 18 * * *"
   workflow_dispatch:
 
 env:
