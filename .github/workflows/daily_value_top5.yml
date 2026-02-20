@@ -2,7 +2,7 @@ name: Daily Value Top 5 (Free) -> Pushover
 
 on:
   schedule:
-    - cron: "0 18 * * *"
+    - cron: "23 18 * * *"
   workflow_dispatch:
 
 env:
